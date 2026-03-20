@@ -1,7 +1,10 @@
+# -*- coding: utf-8 -*-
 """
-Memory tools for Agent
+Agent记忆工具模块
 
-Provides memory_search and memory_get tools
+提供memory_search和memory_get工具：
+- MemorySearchTool: 语义和关键词搜索长期记忆
+- MemoryGetTool: 读取记忆文件内容
 """
 
 from agent.tools.memory.memory_search import MemorySearchTool

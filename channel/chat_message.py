@@ -44,7 +44,7 @@ class ChatMessage(object):
     from_user_nickname = None
     to_user_id = None
     to_user_nickname = None
-    other_user_id = None
+    other_user_id = None  # Note 这一般是用来保存群的id和昵称
     other_user_nickname = None
     my_msg = False
     self_display_name = None

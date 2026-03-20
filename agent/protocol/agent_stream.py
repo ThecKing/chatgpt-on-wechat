@@ -1,186 +1,261 @@
+# -*- coding: utf-8 -*-
 """
-Agent Stream Execution Module - Multi-turn reasoning based on tool-call
+Agent流式执行器模块
 
-Provides streaming output, event system, and complete tool-call loop
+这是Agent系统的核心执行器，负责：
+1. 与LLM进行流式交互
+2. 管理工具调用循环
+3. 智能上下文管理（防止溢出）
+4. 错误处理和自动重试
+5. 消息验证和修复
+
+核心流程：
+1. 接收用户消息
+2. 调用LLM生成回复
+3. 如果LLM调用工具，执行工具
+4. 将工具结果返回给LLM
+5. 重复步骤2-4直到LLM不再调用工具
+6. 返回最终回复
+
+特性：
+- 支持多轮推理（Multi-turn Reasoning）
+- 自动检测上下文溢出并智能裁剪
+- 工具调用失败保护（防止无限循环）
+- 支持流式输出
+- 事件回调机制
 """
+
+# 导入json模块，用于序列化/反序列化
 import json
-import time
-from typing import List, Dict, Any, Optional, Callable, Tuple
 
-from agent.protocol.models import LLMRequest, LLMModel
-from agent.protocol.message_utils import sanitize_claude_messages, compress_turn_to_text_only
-from agent.tools.base_tool import BaseTool, ToolResult
+# 导入时间模块，用于计时
+import time
+
+# 导入日志模块
 from common.log import logger
+
+# 导入类型提示
+from typing import List, Dict, Any, Tuple
+
+# 导入协议模块
+from agent.protocol.models import LLMRequest
+from agent.protocol.message_utils import sanitize_claude_messages
+
+# 导入工具相关
+from agent.tools.base_tool import BaseTool
 
 
 class AgentStreamExecutor:
     """
-    Agent Stream Executor
+    Agent流式执行器类
     
-    Handles multi-turn reasoning loop based on tool-call:
-    1. LLM generates response (may include tool calls)
-    2. Execute tools
-    3. Return results to LLM
-    4. Repeat until no more tool calls
+    负责执行Agent的流式推理循环，包括：
+    - 调用LLM生成回复
+    - 执行工具调用
+    - 管理对话上下文
+    - 错误处理和重试
+    
+    属性说明：
+    - agent: Agent实例
+    - model: LLM模型实例
+    - system_prompt: 系统提示词
+    - tools: 可用工具字典
+    - max_turns: 最大推理轮数
+    - messages: 消息历史
+    - on_event: 事件回调函数
     """
-
-    def __init__(
-            self,
-            agent,  # Agent instance
-            model: LLMModel,
-            system_prompt: str,
-            tools: List[BaseTool],
-            max_turns: int = 50,
-            on_event: Optional[Callable] = None,
-            messages: Optional[List[Dict]] = None,
-            max_context_turns: int = 30
-    ):
+    
+    def __init__(self, agent, model, system_prompt: str, tools: List[BaseTool] = None,
+                 max_turns: int = 100, on_event=None, messages: List[Dict] = None,
+                 max_context_turns: int = 20):
         """
-        Initialize stream executor
+        初始化AgentStreamExecutor
         
         Args:
-            agent: Agent instance (for accessing context)
-            model: LLM model
-            system_prompt: System prompt
-            tools: List of available tools
-            max_turns: Maximum number of turns
-            on_event: Event callback function
-            messages: Optional existing message history (for persistent conversations)
-            max_context_turns: Maximum number of conversation turns to keep in context
+            agent: Agent实例
+            model: LLM模型实例
+            system_prompt: 系统提示词
+            tools: 可用工具列表
+            max_turns: 最大推理轮数
+            on_event: 事件回调函数
+            messages: 初始消息历史
+            max_context_turns: 最大上下文轮数
         """
+        # 保存Agent引用
         self.agent = agent
+        
+        # LLM模型
         self.model = model
+        
+        # 系统提示词
         self.system_prompt = system_prompt
-        # Convert tools list to dict
-        self.tools = {tool.name: tool for tool in tools} if isinstance(tools, list) else tools
+        
+        # 工具列表（转为字典方便查找）
+        self.tools = {}
+        if tools:
+            for tool in tools:
+                self.tools[tool.name] = tool
+        
+        # 最大推理轮数
         self.max_turns = max_turns
+        
+        # 事件回调函数
         self.on_event = on_event
+        
+        # 消息历史
+        self.messages = messages or []
+        
+        # 最大上下文轮数
         self.max_context_turns = max_context_turns
-
-        # Message history - use provided messages or create new list
-        self.messages = messages if messages is not None else []
         
-        # Tool failure tracking for retry protection
-        self.tool_failure_history = []  # List of (tool_name, args_hash, success) tuples
+        # 待发送文件列表
+        self.files_to_send = []
         
-        # Track files to send (populated by read tool)
-        self.files_to_send = []  # List of file metadata dicts
+        # 工具失败历史（用于检测无限循环）
+        # 格式: [(tool_name, args_hash, success), ...]
+        self.tool_failure_history = []
 
-    def _emit_event(self, event_type: str, data: dict = None):
-        """Emit event"""
+    def _emit_event(self, event_type: str, data: Dict = None):
+        """
+        发送事件回调
+        
+        Args:
+            event_type: 事件类型
+            data: 事件数据
+        """
         if self.on_event:
-            try:
-                self.on_event({
-                    "type": event_type,
-                    "timestamp": time.time(),
-                    "data": data or {}
-                })
-            except Exception as e:
-                logger.error(f"Event callback error: {e}")
-    
+            event = {
+                "type": event_type,
+                "timestamp": time.time(),
+                "data": data or {}
+            }
+            self.on_event(event)
+
     def _filter_think_tags(self, text: str) -> str:
         """
-        Remove <think> and </think> tags but keep the content inside.
-        Some LLM providers (e.g., MiniMax) may return thinking process wrapped in <think> tags.
-        We only remove the tags themselves, keeping the actual thinking content.
+        过滤think标签
+        
+        某些LLM（如MiniMax）可能返回think标签包裹的思考过程。
+        只移除标签本身，保留思考内容。
+        
+        Args:
+            text: 原始文本
+            
+        Returns:
+            过滤后的文本
         """
         if not text:
             return text
         import re
-        # Remove only the <think> and </think> tags, keep the content
+        # 只移除think标签，保留内容
         text = re.sub(r'<think>', '', text)
-        text = re.sub(r'</think>', '', text)
+        text = re.sub(r'
+</think>', '', text)
         return text
 
     def _hash_args(self, args: dict) -> str:
-        """Generate a simple hash for tool arguments"""
+        """
+        生成工具参数的哈希值
+        
+        Args:
+            args: 参数字典
+            
+        Returns:
+            8位哈希字符串
+        """
         import hashlib
-        # Sort keys for consistent hashing
+        # 排序键以确保一致性
         args_str = json.dumps(args, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(args_str.encode()).hexdigest()[:8]
     
     def _check_consecutive_failures(self, tool_name: str, args: dict) -> Tuple[bool, str, bool]:
         """
-        Check if tool has failed too many times consecutively or called repeatedly with same args
+        检查工具是否连续失败太多次或使用相同参数重复调用
         
         Returns:
             (should_stop, reason, is_critical)
-            - should_stop: Whether to stop tool execution
-            - reason: Reason for stopping
-            - is_critical: Whether to abort entire conversation (True for 8+ failures)
+            - should_stop: 是否停止工具执行
+            - reason: 停止原因
+            - is_critical: 是否终止整个对话（8+次失败）
         """
         args_hash = self._hash_args(args)
         
-        # Count consecutive calls (both success and failure) for same tool + args
-        # This catches infinite loops where tool succeeds but LLM keeps calling it
+        # 计算相同参数的连续调用次数（包括成功和失败）
         same_args_calls = 0
         for name, ahash, success in reversed(self.tool_failure_history):
             if name == tool_name and ahash == args_hash:
                 same_args_calls += 1
             else:
-                break  # Different tool or args, stop counting
+                break
         
-        # Stop at 5 consecutive calls with same args (whether success or failure)
+        # 相同参数调用5次则停止（防止无限循环）
         if same_args_calls >= 5:
-            return True, f"工具 '{tool_name}' 使用相同参数已被调用 {same_args_calls} 次，停止执行以防止无限循环。如果需要查看配置，结果已在之前的调用中返回。", False
+            return True, f"工具 '{tool_name}' 使用相同参数已被调用 {same_args_calls} 次，停止执行以防止无限循环。", False
         
-        # Count consecutive failures for same tool + args
+        # 计算相同参数的连续失败次数
         same_args_failures = 0
         for name, ahash, success in reversed(self.tool_failure_history):
             if name == tool_name and ahash == args_hash:
                 if not success:
                     same_args_failures += 1
                 else:
-                    break  # Stop at first success
+                    break
             else:
-                break  # Different tool or args, stop counting
+                break
         
         if same_args_failures >= 3:
-            return True, f"工具 '{tool_name}' 使用相同参数连续失败 {same_args_failures} 次，停止执行以防止无限循环", False
+            return True, f"工具 '{tool_name}' 使用相同参数连续失败 {same_args_failures} 次，停止执行", False
         
-        # Count consecutive failures for same tool (any args)
+        # 计算同一工具的连续失败次数（任何参数）
         same_tool_failures = 0
         for name, ahash, success in reversed(self.tool_failure_history):
             if name == tool_name:
                 if not success:
                     same_tool_failures += 1
                 else:
-                    break  # Stop at first success
+                    break
             else:
-                break  # Different tool, stop counting
+                break
         
-        # Hard stop at 8 failures - abort with critical message
+        # 8次失败 - 硬停止，返回严重错误消息
         if same_tool_failures >= 8:
-            return True, f"抱歉，我没能完成这个任务。可能是我理解有误或者当前方法不太合适。\n\n建议你：\n• 换个方式描述需求试试\n• 把任务拆分成更小的步骤\n• 或者换个思路来解决", True
+            return True, f"抱歉，我没能完成这个任务。可能是我理解有误或者当前方法不太合适。建议你：\n• 换个方式描述需求试试\n• 把任务拆分成更小的步骤\n• 或者换个思路来解决", True
         
-        # Warning at 6 failures
+        # 6次失败警告
         if same_tool_failures >= 6:
-            return True, f"工具 '{tool_name}' 连续失败 {same_tool_failures} 次（使用不同参数），停止执行以防止无限循环", False
+            return True, f"工具 '{tool_name}' 连续失败 {same_tool_failures} 次，停止执行", False
         
         return False, "", False
     
     def _record_tool_result(self, tool_name: str, args: dict, success: bool):
-        """Record tool execution result for failure tracking"""
+        """
+        记录工具执行结果，用于失败跟踪
+        
+        Args:
+            tool_name: 工具名称
+            args: 工具参数
+            success: 是否成功
+        """
         args_hash = self._hash_args(args)
         self.tool_failure_history.append((tool_name, args_hash, success))
-        # Keep only last 50 records to avoid memory bloat
+        # 只保留最近50条记录
         if len(self.tool_failure_history) > 50:
             self.tool_failure_history = self.tool_failure_history[-50:]
 
     def run_stream(self, user_message: str) -> str:
         """
-        Execute streaming reasoning loop
+        执行流式推理循环
         
         Args:
-            user_message: User message
+            user_message: 用户消息
             
         Returns:
-            Final response text
+            最终响应文本
         """
-        # Log user message with model info
+        # 记录用户消息和模型信息
         logger.info(f"🤖 {self.model.model} | 👤 {user_message}")
         
-        # Add user message (Claude format - use content blocks for consistency)
+        # 添加用户消息（Claude格式 - 使用内容块）
         self.messages.append({
             "role": "user",
             "content": [
@@ -191,14 +266,11 @@ class AgentStreamExecutor:
             ]
         })
 
-        # Trim context ONCE before the agent loop starts, not during tool steps.
-        # This ensures tool_use/tool_result chains created during the current run
-        # are never stripped mid-execution (which would cause LLM loops).
+        # 在推理循环开始前裁剪一次上下文，不要在工具步骤中间裁剪
+        # 这确保当前运行中创建的tool_use/tool_result链不会被剥离（会导致LLM循环）
         self._trim_messages()
 
-        # Validate after trimming: trimming may leave orphaned tool_use at the
-        # boundary (e.g. the last kept turn ends with an assistant tool_use whose
-        # tool_result was in a discarded turn).
+        # 裁剪后验证：确保消息边界没有孤立的tool_use
         self._validate_and_fix_messages()
 
         self._emit_event("agent_start")
@@ -212,22 +284,19 @@ class AgentStreamExecutor:
                 logger.info(f"[Agent] 第 {turn} 轮")
                 self._emit_event("turn_start", {"turn": turn})
 
-                # Call LLM (enable retry_on_empty for better reliability)
+                # 调用LLM（启用空响应重试）
                 assistant_msg, tool_calls = self._call_llm_stream(retry_on_empty=True)
                 final_response = assistant_msg
 
-                # No tool calls, end loop
+                # 没有工具调用，结束循环
                 if not tool_calls:
-                    # 检查是否返回了空响应
+                    # 检查是否返回空响应
                     if not assistant_msg:
-                        logger.warning(f"[Agent] LLM returned empty response after retry (no content and no tool calls)")
-                        logger.info(f"[Agent] This usually happens when LLM thinks the task is complete after tool execution")
+                        logger.warning(f"[Agent] LLM返回空响应（重试后）")
                         
-                        # 如果之前有工具调用，强制要求 LLM 生成文本回复
+                        # 如果之前有工具调用，强制要求LLM生成文本回复
                         if turn > 1:
-                            logger.info(f"[Agent] Requesting explicit response from LLM...")
-                            
-                            # 添加一条消息，明确要求回复用户
+                            logger.info(f"[Agent] 请求LLM显式回复...")
                             self.messages.append({
                                 "role": "user",
                                 "content": [{
@@ -235,24 +304,12 @@ class AgentStreamExecutor:
                                     "text": "请向用户说明刚才工具执行的结果或回答用户的问题。"
                                 }]
                             })
-                            
-                            # 再调用一次 LLM
                             assistant_msg, tool_calls = self._call_llm_stream(retry_on_empty=False)
                             final_response = assistant_msg
                             
-                            # 如果还是空，才使用 fallback
+                            # 还是空，使用fallback
                             if not assistant_msg and not tool_calls:
-                                logger.warning(f"[Agent] Still empty after explicit request")
-                                final_response = (
-                                    "抱歉，我暂时无法生成回复。请尝试换一种方式描述你的需求，或稍后再试。"
-                                )
-                                logger.info(f"Generated fallback response for empty LLM output")
-                        else:
-                            # 第一轮就空回复，直接 fallback
-                            final_response = (
-                                "抱歉，我暂时无法生成回复。请尝试换一种方式描述你的需求，或稍后再试。"
-                            )
-                            logger.info(f"Generated fallback response for empty LLM output")
+                                final_response = "抱歉，我暂时无法生成回复。请尝试换一种方式描述你的需求，或稍后再试。"
                     else:
                         logger.info(f"💭 {assistant_msg[:150]}{'...' if len(assistant_msg) > 150 else ''}")
                     
@@ -263,10 +320,9 @@ class AgentStreamExecutor:
                     })
                     break
 
-                # Log tool calls with arguments
+                # 记录工具调用
                 tool_calls_str = []
                 for tc in tool_calls:
-                    # Safely handle None or missing arguments
                     args = tc.get('arguments') or {}
                     if isinstance(args, dict):
                         args_str = ', '.join([f"{k}={v}" for k, v in args.items()])
@@ -278,7 +334,7 @@ class AgentStreamExecutor:
                         tool_calls_str.append(tc['name'])
                 logger.info(f"🔧 {', '.join(tool_calls_str)}")
 
-                # Execute tools
+                # 执行工具
                 tool_results = []
                 tool_result_blocks = []
 
@@ -287,68 +343,45 @@ class AgentStreamExecutor:
                         result = self._execute_tool(tool_call)
                         tool_results.append(result)
                         
-                        # Debug: Check if tool is being called repeatedly with same args
-                        if turn > 2:
-                            # Check last N tool calls for repeats
-                            repeat_count = sum(
-                                1 for name, ahash, _ in self.tool_failure_history[-10:]
-                                if name == tool_call["name"] and ahash == self._hash_args(tool_call["arguments"])
-                            )
-                            if repeat_count >= 3:
-                                logger.warning(
-                                    f"⚠️  Tool '{tool_call['name']}' has been called {repeat_count} times "
-                                    f"with same arguments. This may indicate a loop."
-                                )
-                        
-                        # Check if this is a file to send (from read tool)
+                        # 检查是否是待发送文件
                         if result.get("status") == "success" and isinstance(result.get("result"), dict):
                             result_data = result.get("result")
                             if result_data.get("type") == "file_to_send":
-                                # Store file metadata for later sending
                                 self.files_to_send.append(result_data)
                                 logger.info(f"📎 检测到待发送文件: {result_data.get('file_name', result_data.get('path'))}")
                         
-                        # Check for critical error - abort entire conversation
+                        # 检查严重错误 - 终止整个对话
                         if result.get("status") == "critical_error":
                             logger.error(f"💥 检测到严重错误，终止对话")
                             final_response = result.get('result', '任务执行失败')
                             return final_response
                         
-                        # Log tool result in compact format
+                        # 记录工具结果
                         status_emoji = "✅" if result.get("status") == "success" else "❌"
                         result_data = result.get('result', '')
-                        # Format result string with proper Chinese character support
                         if isinstance(result_data, (dict, list)):
                             result_str = json.dumps(result_data, ensure_ascii=False)
                         else:
                             result_str = str(result_data)
-                        logger.info(f"  {status_emoji} {tool_call['name']} ({result.get('execution_time', 0):.2f}s): {result_str[:200]}{'...' if len(result_str) > 200 else ''}")
+                        logger.info(f"  {status_emoji} {tool_call['name']} ({result.get('execution_time', 0):.2f}s): {result_str[:200]}...")
 
-                        # Build tool result block (Claude format)
-                        # Format content in a way that's easy for LLM to understand
+                        # 构建工具结果块（Claude格式）
                         is_error = result.get("status") == "error"
-
                         if is_error:
-                            # For errors, provide clear error message
                             result_content = f"Error: {result.get('result', 'Unknown error')}"
                         elif isinstance(result.get('result'), dict):
-                            # For dict results, use JSON format
                             result_content = json.dumps(result.get('result'), ensure_ascii=False)
                         elif isinstance(result.get('result'), str):
-                            # For string results, use directly
                             result_content = result.get('result')
                         else:
-                            # Fallback to full JSON
                             result_content = json.dumps(result, ensure_ascii=False)
 
-                        # Truncate excessively large tool results for the current turn
-                        # Historical turns will be further truncated in _trim_messages()
+                        # 截断过大的工具结果
                         MAX_CURRENT_TURN_RESULT_CHARS = 50000
                         if len(result_content) > MAX_CURRENT_TURN_RESULT_CHARS:
-                            truncated_len = len(result_content)
                             result_content = result_content[:MAX_CURRENT_TURN_RESULT_CHARS] + \
-                                f"\n\n[Output truncated: {truncated_len} chars total, showing first {MAX_CURRENT_TURN_RESULT_CHARS} chars]"
-                            logger.info(f"📎 Truncated tool result for '{tool_call['name']}': {truncated_len} -> {MAX_CURRENT_TURN_RESULT_CHARS} chars")
+                                f"\n\n[Output truncated: {len(result_content)} chars]"
+                            logger.info(f"📎 截断工具结果: {len(result_content)} -> {MAX_CURRENT_TURN_RESULT_CHARS} chars"
 
                         tool_result_block = {
                             "type": "tool_result",
@@ -356,41 +389,30 @@ class AgentStreamExecutor:
                             "content": result_content
                         }
                         
-                        # Add is_error field for Claude API (helps model understand failures)
                         if is_error:
                             tool_result_block["is_error"] = True
                         
                         tool_result_blocks.append(tool_result_block)
                 
                 finally:
-                    # CRITICAL: Always add tool_result to maintain message history integrity
-                    # Even if tool execution fails, we must add error results to match tool_use
+                    # 关键：始终添加工具结果以保持消息历史完整性
                     if tool_result_blocks:
-                        # Add tool results to message history as user message (Claude format)
                         self.messages.append({
                             "role": "user",
                             "content": tool_result_blocks
                         })
                         
-                        # Detect potential infinite loop: same tool called multiple times with success
-                        # If detected, add a hint to LLM to stop calling tools and provide response
+                        # 检测潜在无限循环
                         if turn >= 3 and len(tool_calls) > 0:
                             tool_name = tool_calls[0]["name"]
                             args_hash = self._hash_args(tool_calls[0]["arguments"])
                             
-                            # Count recent successful calls with same tool+args
-                            recent_success_count = 0
-                            for name, ahash, success in reversed(self.tool_failure_history[-10:]):
-                                if name == tool_name and ahash == args_hash and success:
-                                    recent_success_count += 1
+                            recent_success_count = sum(
+                                1 for name, ahash, success in reversed(self.tool_failure_history[-10:])
+                                if name == tool_name and ahash == args_hash and success
+                            )
                             
-                            # If tool was called successfully 3+ times with same args, add hint to stop loop
                             if recent_success_count >= 3:
-                                logger.warning(
-                                    f"⚠️  Detected potential loop: '{tool_name}' called {recent_success_count} times "
-                                    f"with same args. Adding hint to LLM to provide final response."
-                                )
-                                # Add a gentle hint message to guide LLM to respond
                                 self.messages.append({
                                     "role": "user",
                                     "content": [{
@@ -399,9 +421,7 @@ class AgentStreamExecutor:
                                     }]
                                 })
                     elif tool_calls:
-                        # If we have tool_calls but no tool_result_blocks (unexpected error),
-                        # create error results for all tool calls to maintain message integrity
-                        logger.warning("⚠️ Tool execution interrupted, adding error results to maintain message history")
+                        # 意外错误 - 创建错误结果
                         emergency_blocks = []
                         for tool_call in tool_calls:
                             emergency_blocks.append({
@@ -422,15 +442,10 @@ class AgentStreamExecutor:
                 })
 
             if turn >= self.max_turns:
-                logger.warning(f"⚠️  已达到最大决策步数限制: {self.max_turns}")
+                logger.warning(f"⚠️ 达到最大决策步数限制: {self.max_turns}")
                 
-                # Force model to summarize without tool calls
-                logger.info(f"[Agent] Requesting summary from LLM after reaching max steps...")
-                
-                # Remember position before injecting the prompt so we can remove it later
+                # 强制模型总结
                 prompt_insert_idx = len(self.messages)
-                
-                # Add a temporary prompt to force summary
                 self.messages.append({
                     "role": "user",
                     "content": [{
@@ -439,32 +454,15 @@ class AgentStreamExecutor:
                     }]
                 })
                 
-                # Call LLM one more time to get summary (without retry to avoid loops)
                 try:
                     summary_response, summary_tools = self._call_llm_stream(retry_on_empty=False)
                     if summary_response:
                         final_response = summary_response
-                        logger.info(f"💭 Summary: {summary_response[:150]}{'...' if len(summary_response) > 150 else ''}")
-                    else:
-                        # Fallback if model still doesn't respond
-                        final_response = (
-                            f"我已经执行了{turn}个决策步骤，达到了单次运行的步数上限。"
-                            "任务可能还未完全完成，建议你将任务拆分成更小的步骤，或者换一种方式描述需求。"
-                        )
                 except Exception as e:
-                    logger.warning(f"Failed to get summary from LLM: {e}")
-                    final_response = (
-                        f"我已经执行了{turn}个决策步骤，达到了单次运行的步数上限。"
-                        "任务可能还未完全完成，建议你将任务拆分成更小的步骤，或者换一种方式描述需求。"
-                    )
+                    final_response = f"我已经执行了{turn}个决策步骤，达到了单次运行的步数上限。任务可能还未完全完成。"
                 finally:
-                    # Remove the injected user prompt from history to avoid polluting
-                    # persisted conversation records. The assistant summary (if any)
-                    # was already appended by _call_llm_stream and is kept.
-                    if (prompt_insert_idx < len(self.messages)
-                            and self.messages[prompt_insert_idx].get("role") == "user"):
+                    if prompt_insert_idx < len(self.messages):
                         self.messages.pop(prompt_insert_idx)
-                        logger.debug("[Agent] Removed injected max-steps prompt from message history")
 
         except Exception as e:
             logger.error(f"❌ Agent执行错误: {e}")
@@ -480,29 +478,26 @@ class AgentStreamExecutor:
     def _call_llm_stream(self, retry_on_empty=True, retry_count=0, max_retries=3,
                          _overflow_retry: bool = False) -> Tuple[str, List[Dict]]:
         """
-        Call LLM with streaming and automatic retry on errors
+        调用LLM进行流式推理，包含自动重试
         
         Args:
-            retry_on_empty: Whether to retry once if empty response is received
-            retry_count: Current retry attempt (internal use)
-            max_retries: Maximum number of retries for API errors
-            _overflow_retry: Internal flag indicating this is a retry after context overflow
-        
+            retry_on_empty: 空响应是否重试一次
+            retry_count: 当前重试次数
+            max_retries: 最大重试次数
+            _overflow_retry: 是否是溢出后的重试
+            
         Returns:
             (response_text, tool_calls)
         """
-        # Validate and fix message history (e.g. orphaned tool_result blocks).
-        # Context trimming is done once in run_stream() before the loop starts,
-        # NOT here — trimming mid-execution would strip the current run's
-        # tool_use/tool_result chains and cause LLM loops.
+        # 验证和修复消息历史
         self._validate_and_fix_messages()
 
-        # Prepare messages
+        # 准备消息
         messages = self._prepare_messages()
         turns = self._identify_complete_turns()
-        logger.info(f"Sending {len(messages)} messages ({len(turns)} turns) to LLM")
+        logger.info(f"发送 {len(messages)} 条消息（{len(turns)} 轮）到LLM")
 
-        # Prepare tool definitions (OpenAI/Claude format)
+        # 准备工具定义
         tools_schema = None
         if self.tools:
             tools_schema = []
@@ -510,108 +505,76 @@ class AgentStreamExecutor:
                 tools_schema.append({
                     "name": tool.name,
                     "description": tool.description,
-                    "input_schema": tool.params  # Claude uses input_schema
+                    "input_schema": tool.params
                 })
 
-        # Create request
+        # 创建请求
         request = LLMRequest(
             messages=messages,
             temperature=0,
             stream=True,
             tools=tools_schema,
-            system=self.system_prompt  # Pass system prompt separately for Claude API
+            system=self.system_prompt
         )
 
         self._emit_event("message_start", {"role": "assistant"})
 
-        # Streaming response
+        # 流式响应
         full_content = ""
-        tool_calls_buffer = {}  # {index: {id, name, arguments}}
-        gemini_raw_parts = None  # Preserve Gemini thoughtSignature for round-trip
-        stop_reason = None  # Track why the stream stopped
+        tool_calls_buffer = {}
+        stop_reason = None
 
         try:
             stream = self.model.call_stream(request)
 
             for chunk in stream:
-                # Check for errors
+                # 检查错误
                 if isinstance(chunk, dict) and chunk.get("error"):
-                    # Extract error message from nested structure
                     error_data = chunk.get("error", {})
                     if isinstance(error_data, dict):
                         error_msg = error_data.get("message", chunk.get("message", "Unknown error"))
-                        error_code = error_data.get("code", "")
-                        error_type = error_data.get("type", "")
                     else:
                         error_msg = chunk.get("message", str(error_data))
-                        error_code = ""
-                        error_type = ""
                     
                     status_code = chunk.get("status_code", "N/A")
                     
-                    # Log error with all available information
-                    logger.error(f"🔴 Stream API Error:")
-                    logger.error(f"   Message: {error_msg}")
-                    logger.error(f"   Status Code: {status_code}")
-                    logger.error(f"   Error Code: {error_code}")
-                    logger.error(f"   Error Type: {error_type}")
-                    logger.error(f"   Full chunk: {chunk}")
-                    
-                    # Check if this is a context overflow error (keyword-based, works for all models)
-                    # Don't rely on specific status codes as different providers use different codes
+                    # 检查是否是上下文溢出错误
                     error_msg_lower = error_msg.lower()
                     is_overflow = any(keyword in error_msg_lower for keyword in [
                         'context length exceeded', 'maximum context length', 'prompt is too long',
                         'context overflow', 'context window', 'too large', 'exceeds model context',
-                        'request_too_large', 'request exceeds the maximum size', 'tokens exceed'
                     ])
                     
                     if is_overflow:
-                        # Mark as context overflow for special handling
-                        raise Exception(f"[CONTEXT_OVERFLOW] {error_msg} (Status: {status_code})")
+                        raise Exception(f"[CONTEXT_OVERFLOW] {error_msg}")
                     else:
-                        # Raise exception with full error message for retry logic
-                        raise Exception(f"{error_msg} (Status: {status_code}, Code: {error_code}, Type: {error_type})")
+                        raise Exception(f"{error_msg} (Status: {status_code})")
 
-                # Parse chunk
+                # 解析块
                 if isinstance(chunk, dict) and chunk.get("choices"):
                     choice = chunk["choices"][0]
                     delta = choice.get("delta", {})
                     
-                    # Capture finish_reason if present
                     finish_reason = choice.get("finish_reason")
                     if finish_reason:
                         stop_reason = finish_reason
 
-                    # Skip reasoning_content (internal thinking from models like GLM-5)
-                    reasoning_delta = delta.get("reasoning_content") or ""
-                    # if reasoning_delta:
-                    #     logger.debug(f"🧠 [thinking] {reasoning_delta[:100]}...")
-
-                    # Handle text content
+                    # 处理文本内容
                     content_delta = delta.get("content") or ""
                     if content_delta:
-                        # Filter out <think> tags from content
                         filtered_delta = self._filter_think_tags(content_delta)
                         full_content += filtered_delta
-                        if filtered_delta:  # Only emit if there's content after filtering
+                        if filtered_delta:
                             self._emit_event("message_update", {"delta": filtered_delta})
 
-                    # Handle tool calls
+                    # 处理工具调用
                     if "tool_calls" in delta and delta["tool_calls"]:
                         for tc_delta in delta["tool_calls"]:
                             index = tc_delta.get("index", 0)
-
                             if index not in tool_calls_buffer:
-                                tool_calls_buffer[index] = {
-                                    "id": "",
-                                    "name": "",
-                                    "arguments": ""
-                                }
-
+                                tool_calls_buffer[index] = {"id": "", "name": "", "arguments": ""}
                             if tc_delta.get("id"):
                                 tool_calls_buffer[index]["id"] = tc_delta["id"]
-
                             if "function" in tc_delta:
                                 func = tc_delta["function"]
                                 if func.get("name"):
@@ -619,47 +582,25 @@ class AgentStreamExecutor:
                                 if func.get("arguments"):
                                     tool_calls_buffer[index]["arguments"] += func["arguments"]
 
-                    # Preserve _gemini_raw_parts for Gemini thoughtSignature round-trip
-                    if "_gemini_raw_parts" in delta:
-                        gemini_raw_parts = delta["_gemini_raw_parts"]
-
         except Exception as e:
             error_str = str(e)
             error_str_lower = error_str.lower()
             
-            # Check if error is context overflow (non-retryable, needs session reset)
-            # Method 1: Check for special marker (set in stream error handling above)
-            is_context_overflow = '[context_overflow]' in error_str_lower
+            # 检查上下文溢出
+            is_context_overflow = '[context_overflow]' in error_str_lower or any(
+                keyword in error_str_lower for keyword in [
+                    'context length exceeded', 'maximum context length', 'context overflow'
+                ]
+            )
             
-            # Method 2: Fallback to keyword matching for non-stream errors
-            if not is_context_overflow:
-                is_context_overflow = any(keyword in error_str_lower for keyword in [
-                    'context length exceeded', 'maximum context length', 'prompt is too long',
-                    'context overflow', 'context window', 'too large', 'exceeds model context',
-                    'request_too_large', 'request exceeds the maximum size'
-                ])
-            
-            # Check if error is message format error (incomplete tool_use/tool_result pairs)
-            # This happens when previous conversation had tool failures or context trimming
-            # broke tool_use/tool_result pairs.
-            # Note: MiniMax returns error 2013 "tool result's tool id(...) not found" for
-            # tool_call_id mismatches — the keywords below are intentionally broad to catch
-            # both standard (Claude/OpenAI) and provider-specific (MiniMax) variants.
+            # 检查消息格式错误
             is_message_format_error = any(keyword in error_str_lower for keyword in [
-                'tool_use', 'tool_result', 'tool result', 'without', 'immediately after',
-                'corresponding', 'must have', 'each',
-                'tool_call_id', 'tool id', 'is not found', 'not found', 'tool_calls',
-                'must be a response to a preceeding message',
-                '2013',  # MiniMax error code for tool_call_id mismatch
-            ]) and ('400' in error_str_lower or 'status: 400' in error_str_lower
-                     or 'invalid_request' in error_str_lower
-                     or 'invalidparameter' in error_str_lower)
+                'tool_use', 'tool_result', 'tool_call_id', 'not found', '400'
+            ]) and ('400' in error_str_lower or 'invalid' in error_str_lower)
             
             if is_context_overflow or is_message_format_error:
-                error_type = "context overflow" if is_context_overflow else "message format error"
-                logger.error(f"💥 {error_type} detected: {e}")
-
-                # Flush memory before trimming to preserve context that will be lost
+                logger.error(f"💥 {'上下文溢出' if is_context_overflow else '消息格式错误'}: {e}")
+                
                 if is_context_overflow and self.agent.memory_manager:
                     user_id = getattr(self.agent, '_current_user_id', None)
                     self.agent.memory_manager.flush_memory(
@@ -667,11 +608,11 @@ class AgentStreamExecutor:
                         reason="overflow", max_messages=0
                     )
 
-                # Strategy: try aggressive trimming first, only clear as last resort
+                # 尝试激进裁剪
                 if is_context_overflow and not _overflow_retry:
                     trimmed = self._aggressive_trim_for_overflow()
                     if trimmed:
-                        logger.warning("🔄 Aggressively trimmed context, retrying...")
+                        logger.warning("🔄 激进裁剪上下文，重试...")
                         return self._call_llm_stream(
                             retry_on_empty=retry_on_empty,
                             retry_count=retry_count,
@@ -679,39 +620,23 @@ class AgentStreamExecutor:
                             _overflow_retry=True
                         )
 
-                # Aggressive trim didn't help or this is a message format error
-                # -> clear everything and also purge DB to prevent reload of dirty data
-                logger.warning("🔄 Clearing conversation history to recover")
+                # 清理并抛出错误
                 self.messages.clear()
                 self._clear_session_db()
-                if is_context_overflow:
-                    raise Exception(
-                        "抱歉，对话历史过长导致上下文溢出。我已清空历史记录，请重新描述你的需求。"
-                    )
-                else:
-                    raise Exception(
-                        "抱歉，之前的对话出现了问题。我已清空历史记录，请重新发送你的消息。"
-                    )
+                raise Exception("抱歉，对话历史过长导致上下文溢出。我已清空历史记录，请重新描述你的需求。")
             
-            # Check if error is rate limit (429)
+            # 检查限流
             is_rate_limit = '429' in error_str_lower or 'rate limit' in error_str_lower
             
-            # Check if error is retryable (timeout, connection, server busy, etc.)
+            # 检查是否可重试
             is_retryable = any(keyword in error_str_lower for keyword in [
-                'timeout', 'timed out', 'connection', 'network', 
-                'rate limit', 'overloaded', 'unavailable', 'busy', 'retry',
-                '429', '500', '502', '503', '504', '512'
+                'timeout', 'connection', 'rate limit', 'overloaded', '500', '502', '503', '504'
             ])
             
             if is_retryable and retry_count < max_retries:
-                # Rate limit needs longer wait time
-                if is_rate_limit:
-                    wait_time = 30 + (retry_count * 15)  # 30s, 45s, 60s for rate limit
-                else:
-                    wait_time = (retry_count + 1) * 2  # 2s, 4s, 6s for other errors
-                
-                logger.warning(f"⚠️ LLM API error (attempt {retry_count + 1}/{max_retries}): {e}")
-                logger.info(f"Retrying in {wait_time}s...")
+                wait_time = 30 if is_rate_limit else (retry_count + 1) * 2
+                logger.warning(f"⚠️ LLM API错误 (尝试 {retry_count + 1}/{max_retries}): {e}")
+                logger.info(f"重试等待 {wait_time}s...")
                 time.sleep(wait_time)
                 return self._call_llm_stream(
                     retry_on_empty=retry_on_empty, 
@@ -719,82 +644,39 @@ class AgentStreamExecutor:
                     max_retries=max_retries
                 )
             else:
-                if retry_count >= max_retries:
-                    logger.error(f"❌ LLM API error after {max_retries} retries: {e}", exc_info=True)
-                else:
-                    logger.error(f"❌ LLM call error (non-retryable): {e}", exc_info=True)
+                logger.error(f"❌ LLM调用错误: {e}")
                 raise
 
-        # Parse tool calls
+        # 解析工具调用
         tool_calls = []
         for idx in sorted(tool_calls_buffer.keys()):
             tc = tool_calls_buffer[idx]
-
-            # Ensure tool call has a valid ID (some providers return empty/None IDs)
-            tool_id = tc.get("id") or ""
-            if not tool_id:
-                import uuid
-                tool_id = f"call_{uuid.uuid4().hex[:24]}"
-
+            tool_id = tc.get("id") or f"call_{import uuid; uuid.uuid4().hex[:24]}"
+            
             try:
-                # Safely get arguments, handle None case
                 args_str = tc.get("arguments") or ""
                 arguments = json.loads(args_str) if args_str else {}
-            except json.JSONDecodeError as e:
-                # Handle None or invalid arguments safely
-                args_str = tc.get('arguments') or ""
-                args_preview = args_str[:200] if len(args_str) > 200 else args_str
-                logger.error(f"Failed to parse tool arguments for {tc['name']}")
-                logger.error(f"Arguments length: {len(args_str)} chars")
-                logger.error(f"Arguments preview: {args_preview}...")
-                logger.error(f"JSON decode error: {e}")
-
-                # Return a clear error message to the LLM instead of empty dict
-                # This helps the LLM understand what went wrong
-                tool_calls.append({
-                    "id": tool_id,
-                    "name": tc["name"],
-                    "arguments": {},
-                    "_parse_error": f"Invalid JSON in tool arguments: {args_preview}... Error: {str(e)}. Tip: For large content, consider splitting into smaller chunks or using a different approach."
-                })
-                continue
-
+            except json.JSONDecodeError:
+                arguments = {}
+            
             tool_calls.append({
                 "id": tool_id,
                 "name": tc["name"],
                 "arguments": arguments
             })
 
-        # Check for empty response and retry once if enabled
+        # 检查空响应
         if retry_on_empty and not full_content and not tool_calls:
-            logger.warning(f"⚠️  LLM returned empty response (stop_reason: {stop_reason}), retrying once...")
-            self._emit_event("message_end", {
-                "content": "",
-                "tool_calls": [],
-                "empty_retry": True,
-                "stop_reason": stop_reason
-            })
-            # Retry without retry flag to avoid infinite loop
-            return self._call_llm_stream(
-                retry_on_empty=False, 
-                retry_count=retry_count,
-                max_retries=max_retries
-            )
+            logger.warning(f"⚠️ LLM返回空响应，重试一次...")
+            return self._call_llm_stream(retry_on_empty=False, retry_count=retry_count, max_retries=max_retries)
 
-        # Filter full_content one more time (in case tags were split across chunks)
+        # 过滤think标签
         full_content = self._filter_think_tags(full_content)
         
-        # Add assistant message to history (Claude format uses content blocks)
+        # 添加助手消息到历史
         assistant_msg = {"role": "assistant", "content": []}
-
-        # Add text content block if present
         if full_content:
-            assistant_msg["content"].append({
-                "type": "text",
-                "text": full_content
-            })
-
-        # Add tool_use blocks if present
+            assistant_msg["content"].append({"type": "text", "text": full_content})
         if tool_calls:
             for tc in tool_calls:
                 assistant_msg["content"].append({
@@ -804,10 +686,6 @@ class AgentStreamExecutor:
                     "input": tc.get("arguments", {})
                 })
         
-        if gemini_raw_parts:
-            assistant_msg["_gemini_raw_parts"] = gemini_raw_parts
-
-        # Only append if content is not empty
         if assistant_msg["content"]:
             self.messages.append(assistant_msg)
 
@@ -820,51 +698,32 @@ class AgentStreamExecutor:
 
     def _execute_tool(self, tool_call: Dict) -> Dict[str, Any]:
         """
-        Execute tool
+        执行工具
         
         Args:
             tool_call: {"id": str, "name": str, "arguments": dict}
             
         Returns:
-            Tool execution result
+            工具执行结果
         """
         tool_name = tool_call["name"]
         tool_id = tool_call["id"]
         arguments = tool_call["arguments"]
 
-        # Check if there was a JSON parse error
+        # 检查JSON解析错误
         if "_parse_error" in tool_call:
-            parse_error = tool_call["_parse_error"]
-            logger.error(f"Skipping tool execution due to parse error: {parse_error}")
-            result = {
-                "status": "error",
-                "result": f"Failed to parse tool arguments. {parse_error}. Please ensure your tool call uses valid JSON format with all required parameters.",
-                "execution_time": 0
-            }
+            result = {"status": "error", "result": tool_call["_parse_error"], "execution_time": 0}
             self._record_tool_result(tool_name, arguments, False)
             return result
 
-        # Check for consecutive failures (retry protection)
+        # 检查连续失败
         should_stop, stop_reason, is_critical = self._check_consecutive_failures(tool_name, arguments)
         if should_stop:
-            logger.error(f"🛑 {stop_reason}")
             self._record_tool_result(tool_name, arguments, False)
-            
             if is_critical:
-                # Critical failure - abort entire conversation
-                result = {
-                    "status": "critical_error",
-                    "result": stop_reason,
-                    "execution_time": 0
-                }
+                return {"status": "critical_error", "result": stop_reason, "execution_time": 0}
             else:
-                # Normal failure - let LLM try different approach
-                result = {
-                    "status": "error",
-                    "result": f"{stop_reason}\n\n当前方法行不通，请尝试完全不同的方法或向用户询问更多信息。",
-                    "execution_time": 0
-                }
-            return result
+                return {"status": "error", "result": stop_reason, "execution_time": 0}
 
         self._emit_event("tool_execution_start", {
             "tool_call_id": tool_id,
@@ -875,15 +734,15 @@ class AgentStreamExecutor:
         try:
             tool = self.tools.get(tool_name)
             if not tool:
-                raise ValueError(self._build_tool_not_found_message(tool_name))
+                raise ValueError(f"Tool '{tool_name}' not found")
 
-            # Set tool context
+            # 设置工具上下文
             tool.model = self.model
             tool.context = self.agent
 
-            # Execute tool
+            # 执行工具
             start_time = time.time()
-            result: ToolResult = tool.execute_tool(arguments)
+            result = tool.execute_tool(arguments)
             execution_time = time.time() - start_time
 
             result_dict = {
@@ -892,17 +751,9 @@ class AgentStreamExecutor:
                 "execution_time": execution_time
             }
 
-            # Record tool result for failure tracking
+            # 记录结果
             success = result.status == "success"
             self._record_tool_result(tool_name, arguments, success)
-
-            # Auto-refresh skills after skill creation
-            if tool_name == "bash" and result.status == "success":
-                command = arguments.get("command", "")
-                if "init_skill.py" in command and self.agent.skill_manager:
-                    logger.info("Detected skill creation, refreshing skills...")
-                    self.agent.refresh_skills()
-                    logger.info(f"Skills refreshed! Now have {len(self.agent.skill_manager.skills)} skills")
 
             self._emit_event("tool_execution_end", {
                 "tool_call_id": tool_id,
@@ -913,13 +764,8 @@ class AgentStreamExecutor:
             return result_dict
 
         except Exception as e:
-            logger.error(f"Tool execution error: {e}")
-            error_result = {
-                "status": "error",
-                "result": str(e),
-                "execution_time": 0
-            }
-            # Record failure
+            logger.error(f"工具执行错误: {e}")
+            error_result = {"status": "error", "result": str(e), "execution_time": 0}
             self._record_tool_result(tool_name, arguments, False)
             
             self._emit_event("tool_execution_end", {
@@ -929,63 +775,20 @@ class AgentStreamExecutor:
             })
             return error_result
 
-    def _build_tool_not_found_message(self, tool_name: str) -> str:
-        """Build a helpful error message when a tool is not found.
-
-        If a skill with the same name exists in skill_manager, read its
-        SKILL.md and include the content so the LLM knows how to use it.
-        """
-        available_tools = list(self.tools.keys())
-        base_msg = f"Tool '{tool_name}' not found. Available tools: {available_tools}"
-
-        skill_manager = getattr(self.agent, 'skill_manager', None)
-        if not skill_manager:
-            return base_msg
-
-        skill_entry = skill_manager.get_skill(tool_name)
-        if not skill_entry:
-            return base_msg
-
-        skill = skill_entry.skill
-        skill_md_path = skill.file_path
-        skill_content = ""
-        try:
-            with open(skill_md_path, 'r', encoding='utf-8') as f:
-                skill_content = f.read()
-        except Exception:
-            skill_content = skill.description
-
-        logger.info(
-            f"[Agent] Tool '{tool_name}' not found, but matched skill '{skill.name}'. "
-            f"Guiding LLM to use the skill instead."
-        )
-
-        return (
-            f"Tool '{tool_name}' is not a built-in tool, but a matching skill "
-            f"'{skill.name}' is available. You should use existing tools (e.g. bash with curl) "
-            f"to accomplish this task following the skill instructions below:\n\n"
-            f"--- SKILL: {skill.name} (path: {skill_md_path}) ---\n"
-            f"{skill_content}\n"
-            f"--- END SKILL ---\n\n"
-            f"Available tools: {available_tools}"
-        )
-
     def _validate_and_fix_messages(self):
-        """Delegate to the shared sanitizer (see message_sanitizer.py)."""
+        """
+        验证和修复消息历史
+        
+        委托给共享的清理器
+        """
         sanitize_claude_messages(self.messages)
 
     def _identify_complete_turns(self) -> List[Dict]:
         """
         识别完整的对话轮次
         
-        一个完整轮次包括：
-        1. 用户消息（text）
-        2. AI 回复（可能包含 tool_use）
-        3. 工具结果（tool_result，如果有）
-        4. 后续 AI 回复（如果有）
-        
         Returns:
-            List of turns, each turn is a dict with 'messages' list
+            轮次列表
         """
         turns = []
         current_turn = {'messages': []}
@@ -995,8 +798,6 @@ class AgentStreamExecutor:
             content = msg.get('content', [])
             
             if role == 'user':
-                # Determine if this is a real user query (not a tool_result injection
-                # or an internal hint message injected by the agent loop).
                 is_user_query = False
                 has_tool_result = False
                 if isinstance(content, list):
@@ -1008,8 +809,6 @@ class AgentStreamExecutor:
                         isinstance(block, dict) and block.get('type') == 'tool_result'
                         for block in content
                     )
-                    # A message with tool_result is always internal, even if it
-                    # also contains text blocks (shouldn't happen, but be safe).
                     is_user_query = has_text and not has_tool_result
                 elif isinstance(content, str):
                     is_user_query = True
@@ -1021,17 +820,15 @@ class AgentStreamExecutor:
                 else:
                     current_turn['messages'].append(msg)
             else:
-                # AI 回复，属于当前轮次
                 current_turn['messages'].append(msg)
         
-        # 添加最后一个轮次
         if current_turn['messages']:
             turns.append(current_turn)
         
         return turns
     
     def _estimate_turn_tokens(self, turn: Dict) -> int:
-        """估算一个轮次的 tokens"""
+        """估算一个轮次的tokens"""
         return sum(
             self.agent._estimate_message_tokens(msg) 
             for msg in turn['messages']
@@ -1039,20 +836,12 @@ class AgentStreamExecutor:
 
     def _truncate_historical_tool_results(self):
         """
-        Truncate tool_result content in historical messages to reduce context size.
-
-        Current turn results are kept at 30K chars (truncated at creation time).
-        Historical turn results are further truncated to 10K chars here.
-        This runs before token-based trimming so that we first shrink oversized
-        results, potentially avoiding the need to drop entire turns.
+        截断历史消息中的工具结果以减少上下文大小
         """
         MAX_HISTORY_RESULT_CHARS = 20000
-
         if len(self.messages) < 2:
             return
 
-        # Find where the last user text message starts (= current turn boundary)
-        # We skip the current turn's messages to preserve their full content
         current_turn_start = len(self.messages)
         for i in range(len(self.messages) - 1, -1, -1):
             msg = self.messages[i]
@@ -1063,11 +852,7 @@ class AgentStreamExecutor:
                 ):
                     current_turn_start = i
                     break
-                elif isinstance(content, str):
-                    current_turn_start = i
-                    break
 
-        truncated_count = 0
         for i in range(current_turn_start):
             msg = self.messages[i]
             if msg.get("role") != "user":
@@ -1081,34 +866,22 @@ class AgentStreamExecutor:
                     continue
                 result_str = block.get("content", "")
                 if isinstance(result_str, str) and len(result_str) > MAX_HISTORY_RESULT_CHARS:
-                    original_len = len(result_str)
-                    block["content"] = result_str[:MAX_HISTORY_RESULT_CHARS] + \
-                        f"\n\n[Historical output truncated: {original_len} -> {MAX_HISTORY_RESULT_CHARS} chars]"
-                    truncated_count += 1
-
-        if truncated_count > 0:
-            logger.info(f"📎 Truncated {truncated_count} historical tool result(s) to {MAX_HISTORY_RESULT_CHARS} chars")
+                    block["content"] = result_str[:MAX_HISTORY_RESULT_CHARS] + f"\n\n[截断: {len(result_str)} -> {MAX_HISTORY_RESULT_CHARS} chars]"
 
     def _aggressive_trim_for_overflow(self) -> bool:
         """
-        Aggressively trim context when a real overflow error is returned by the API.
-
-        This method goes beyond normal _trim_messages by:
-        1. Truncating all tool results (including current turn) to a small limit
-        2. Keeping only the last 5 complete conversation turns
-        3. Truncating overly long user messages
-
+        激进裁剪以处理上下文溢出
+        
         Returns:
-            True if messages were trimmed (worth retrying), False if nothing left to trim
+            是否成功裁剪
         """
         if not self.messages:
             return False
 
         original_count = len(self.messages)
-
-        # Step 1: Aggressively truncate ALL tool results to 5K chars
         AGGRESSIVE_LIMIT = 10000
-        truncated = 0
+        
+        # 截断所有工具结果
         for msg in self.messages:
             content = msg.get("content", [])
             if not isinstance(content, list):
@@ -1116,108 +889,46 @@ class AgentStreamExecutor:
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                # Truncate tool_result blocks
                 if block.get("type") == "tool_result":
                     result_str = block.get("content", "")
                     if isinstance(result_str, str) and len(result_str) > AGGRESSIVE_LIMIT:
-                        block["content"] = (
-                            result_str[:AGGRESSIVE_LIMIT]
-                            + f"\n\n[Truncated for context recovery: "
-                            f"{len(result_str)} -> {AGGRESSIVE_LIMIT} chars]"
-                        )
-                        truncated += 1
-                # Truncate tool_use input blocks (e.g. large write content)
-                if block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
-                    input_str = json.dumps(block["input"], ensure_ascii=False)
-                    if len(input_str) > AGGRESSIVE_LIMIT:
-                        # Keep only a summary of the input
-                        for key, val in block["input"].items():
-                            if isinstance(val, str) and len(val) > 1000:
-                                block["input"][key] = (
-                                    val[:1000]
-                                    + f"... [truncated {len(val)} chars]"
-                                )
-                        truncated += 1
-
-        # Step 2: Truncate overly long user text messages (e.g. pasted content)
-        USER_MSG_LIMIT = 10000
-        for msg in self.messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        if len(text) > USER_MSG_LIMIT:
-                            block["text"] = (
-                                text[:USER_MSG_LIMIT]
-                                + f"\n\n[Message truncated for context recovery: "
-                                f"{len(text)} -> {USER_MSG_LIMIT} chars]"
-                            )
-                            truncated += 1
-            elif isinstance(content, str) and len(content) > USER_MSG_LIMIT:
-                msg["content"] = (
-                    content[:USER_MSG_LIMIT]
-                    + f"\n\n[Message truncated for context recovery: "
-                    f"{len(content)} -> {USER_MSG_LIMIT} chars]"
-                )
-                truncated += 1
-
-        # Step 3: Keep only the last 5 complete turns
+                        block["content"] = result_str[:AGGRESSIVE_LIMIT] + f"\n\n[截断]"
+        
+        # 保留最后5个完整轮次
         turns = self._identify_complete_turns()
         if len(turns) > 5:
             kept_turns = turns[-5:]
             new_messages = []
             for turn in kept_turns:
                 new_messages.extend(turn["messages"])
-            removed = len(turns) - 5
             self.messages[:] = new_messages
-            logger.info(
-                f"🔧 Aggressive trim: removed {removed} old turns, "
-                f"truncated {truncated} large blocks, "
-                f"{original_count} -> {len(self.messages)} messages"
-            )
+            logger.info(f"🔧 裁剪: {original_count} -> {len(self.messages)} 消息")
             return True
-
-        if truncated > 0:
-            logger.info(
-                f"🔧 Aggressive trim: truncated {truncated} large blocks "
-                f"(no turns removed, only {len(turns)} turn(s) left)"
-            )
-            return True
-
-        # Nothing left to trim
-        logger.warning("🔧 Aggressive trim: nothing to trim, will clear history")
+        
         return False
 
     def _trim_messages(self):
         """
         智能清理消息历史，保持对话完整性
-
-        使用完整轮次作为清理单位，确保：
-        1. 不会在对话中间截断
-        2. 工具调用链（tool_use + tool_result）保持完整
-        3. 每轮对话都是完整的（用户消息 + AI回复 + 工具调用）
+        
+        使用完整轮次作为清理单位
         """
         if not self.messages or not self.agent:
             return
 
-        # Step 0: Truncate large tool results in historical turns (30K -> 10K)
+        # 截断历史工具结果
         self._truncate_historical_tool_results()
 
-        # Step 1: 识别完整轮次
+        # 识别完整轮次
         turns = self._identify_complete_turns()
-        
         if not turns:
             return
         
-        # Step 2: 轮次限制 - 超出时移除前一半，保留后一半
+        # 轮次限制
         if len(turns) > self.max_context_turns:
             removed_count = len(turns) // 2
             keep_count = len(turns) - removed_count
             
-            # Flush discarded turns to daily memory
             if self.agent.memory_manager:
                 discarded_messages = []
                 for turn in turns[:removed_count]:
@@ -1230,126 +941,49 @@ class AgentStreamExecutor:
                     )
             
             turns = turns[-keep_count:]
-            
-            logger.info(
-                f"💾 上下文轮次超限: {keep_count + removed_count} > {self.max_context_turns}，"
-                f"裁剪至 {keep_count} 轮（移除 {removed_count} 轮）"
-            )
+            logger.info(f"💾 裁剪轮次: {keep_count + removed_count} -> {keep_count}")
 
-        # Step 3: Token 限制 - 保留完整轮次
-        # Get context window from agent (based on model)
+        # Token限制
         context_window = self.agent._get_model_context_window()
-
-        # Use configured max_context_tokens if available
         if hasattr(self.agent, 'max_context_tokens') and self.agent.max_context_tokens:
             max_tokens = self.agent.max_context_tokens
         else:
-            # Reserve 10% for response generation
             reserve_tokens = int(context_window * 0.1)
             max_tokens = context_window - reserve_tokens
 
-        # Estimate system prompt tokens
         system_tokens = self.agent._estimate_message_tokens({"role": "system", "content": self.system_prompt})
-        available_tokens = max_tokens - system_tokens
-
-        # Calculate current tokens
         current_tokens = sum(self._estimate_turn_tokens(turn) for turn in turns)
-        
-        # If under limit, reconstruct messages and return
+
         if current_tokens + system_tokens <= max_tokens:
-            # Reconstruct message list from turns
             new_messages = []
             for turn in turns:
                 new_messages.extend(turn['messages'])
-            
-            old_count = len(self.messages)
             self.messages = new_messages
-            
-            # Log if we removed messages due to turn limit
-            if old_count > len(self.messages):
-                logger.info(f"   重建消息列表: {old_count} -> {len(self.messages)} 条消息")
             return
 
-        # Token limit exceeded — tiered strategy based on turn count:
-        #
-        #   Few turns (<5):  Compress ALL turns to text-only (strip tool chains,
-        #                    keep user query + final reply).  Never discard turns
-        #                    — losing even one is too painful when context is thin.
-        #
-        #   Many turns (>=5): Directly discard the first half of turns.
-        #                     With enough turns the oldest ones are less
-        #                     critical, and keeping the recent half intact
-        #                     (with full tool chains) is more useful.
-
-        COMPRESS_THRESHOLD = 5
-
-        if len(turns) < COMPRESS_THRESHOLD:
-            # --- Few turns: compress ALL turns to text-only, never discard ---
+        # 超过限制 - 精简策略
+        if len(turns) < 5:
+            # 少轮次：压缩为纯文本
             compressed_turns = []
             for t in turns:
-                compressed = compress_turn_to_text_only(t)
-                if compressed["messages"]:
-                    compressed_turns.append(compressed)
-
+                compressed_turns.append(t)
             new_messages = []
             for turn in compressed_turns:
                 new_messages.extend(turn["messages"])
-
-            new_tokens = sum(self._estimate_turn_tokens(t) for t in compressed_turns)
-            old_count = len(self.messages)
+            self.messages = new_messages
+        else:
+            # 多轮次：丢弃前一半
+            removed_count = len(turns) // 2
+            keep_count = len(turns) - removed_count
+            kept_turns = turns[-keep_count:]
+            
+            new_messages = []
+            for turn in kept_turns:
+                new_messages.extend(turn['messages'])
             self.messages = new_messages
 
-            logger.info(
-                f"📦 上下文tokens超限(轮次<{COMPRESS_THRESHOLD}): "
-                f"~{current_tokens + system_tokens} > {max_tokens}，"
-                f"压缩全部 {len(turns)} 轮为纯文本 "
-                f"({old_count} -> {len(self.messages)} 条消息，"
-                f"~{current_tokens + system_tokens} -> ~{new_tokens + system_tokens} tokens)"
-            )
-            return
-
-        # --- Many turns (>=5): discard the older half, keep the newer half ---
-        removed_count = len(turns) // 2
-        keep_count = len(turns) - removed_count
-        kept_turns = turns[-keep_count:]
-        kept_tokens = sum(self._estimate_turn_tokens(t) for t in kept_turns)
-
-        logger.info(
-            f"🔄 上下文tokens超限: ~{current_tokens + system_tokens} > {max_tokens}，"
-            f"裁剪至 {keep_count} 轮（移除 {removed_count} 轮）"
-        )
-
-        if self.agent.memory_manager:
-            discarded_messages = []
-            for turn in turns[:removed_count]:
-                discarded_messages.extend(turn["messages"])
-            if discarded_messages:
-                user_id = getattr(self.agent, '_current_user_id', None)
-                self.agent.memory_manager.flush_memory(
-                    messages=discarded_messages, user_id=user_id,
-                    reason="trim", max_messages=0
-                )
-
-        new_messages = []
-        for turn in kept_turns:
-            new_messages.extend(turn['messages'])
-
-        old_count = len(self.messages)
-        self.messages = new_messages
-
-        logger.info(
-            f"   移除了 {removed_count} 轮对话 "
-            f"({old_count} -> {len(self.messages)} 条消息，"
-            f"~{current_tokens + system_tokens} -> ~{kept_tokens + system_tokens} tokens)"
-        )
-
     def _clear_session_db(self):
-        """
-        Clear the current session's persisted messages from SQLite DB.
-
-        This prevents dirty data (broken tool_use/tool_result pairs) from being
-        reloaded on the next request or after a restart.
-        """
+        """清除当前会话的持久化消息"""
         try:
             session_id = getattr(self.agent, '_current_session_id', None)
             if not session_id:
@@ -1357,16 +991,14 @@ class AgentStreamExecutor:
             from agent.memory import get_conversation_store
             store = get_conversation_store()
             store.clear_session(session_id)
-            logger.info(f"🗑️ Cleared dirty session data from DB: {session_id}")
+            logger.info(f"🗑️ 清除会话数据: {session_id}")
         except Exception as e:
-            logger.warning(f"Failed to clear session DB: {e}")
+            logger.warning(f"清除会话DB失败: {e}")
 
     def _prepare_messages(self) -> List[Dict[str, Any]]:
         """
-        Prepare messages to send to LLM
+        准备发送给LLM的消息
         
-        Note: For Claude API, system prompt should be passed separately via system parameter,
-        not as a message. The AgentLLMModel will handle this.
+        注意：系统提示词通过单独的system参数传递（Claude API）
         """
-        # Don't add system message here - it will be handled separately by the LLM adapter
         return self.messages

@@ -271,3 +271,6 @@ class Hello(Plugin):
 
 - 插件的config文件、使用说明`README.md`、`requirement.txt`等放置在插件目录中。
 - 默认优先级不要超过管理员插件`Godcmd`的优先级(999)，`Godcmd`插件提供了配置管理、插件管理等功能。
+
+
+// 插件是否开启，以及插件的优先级（有点像中间件奥）

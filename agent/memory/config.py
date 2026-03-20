@@ -1,99 +1,148 @@
+# -*- coding: utf-8 -*-
 """
-Memory configuration module
+记忆配置模块
 
-Provides global memory configuration with simplified workspace structure
+提供全局记忆配置，简化工作区结构。
+
+配置项：
+- workspace_root: 工作区根目录（默认：~/cow）
+- embedding_provider: 向量嵌入提供者（openai/local）
+- embedding_model: 嵌入模型名称
+- chunk_max_tokens: 分块最大token数
+- max_results: 搜索最大结果数
 """
 
+# 启用延迟类型注解
 from __future__ import annotations
+
+# 导入操作系统模块
 import os
+
+# 导入数据类装饰器
 from dataclasses import dataclass, field
+
+# 导入类型提示
 from typing import Optional, List
+
+# 导入路径处理
 from pathlib import Path
 
 
 def _default_workspace():
-    """Get default workspace path with proper Windows support"""
+    """
+    获取默认工作区路径（支持Windows）
+    
+    Returns:
+        str: 默认工作区路径
+    """
     from common.utils import expand_path
     return expand_path("~/cow")
 
 
 @dataclass
 class MemoryConfig:
-    """Configuration for memory storage and search"""
+    """
+    记忆存储和搜索配置类
     
-    # Storage paths (default: ~/cow)
+    使用数据类简化配置管理。
+    支持向量嵌入、分块、搜索等多种配置。
+    """
+    
+    # 存储路径（默认：~/cow）
     workspace_root: str = field(default_factory=_default_workspace)
     
-    # Embedding config
-    embedding_provider: str = "openai"  # "openai" | "local"
-    embedding_model: str = "text-embedding-3-small"
-    embedding_dim: int = 1536
+    # 向量嵌入配置
+    embedding_provider: str = "openai"  # 嵌入提供者："openai" | "local"
+    embedding_model: str = "text-embedding-3-small"  # 嵌入模型名称
+    embedding_dim: int = 1536  # 嵌入向量维度
     
-    # Chunking config
-    chunk_max_tokens: int = 500
-    chunk_overlap_tokens: int = 50
+    # 分块配置
+    chunk_max_tokens: int = 500  # 每块最大token数
+    chunk_overlap_tokens: int = 50  # 块之间重叠token数
     
-    # Search config
-    max_results: int = 10
-    min_score: float = 0.1
+    # 搜索配置
+    max_results: int = 10  # 最大返回结果数
+    min_score: float = 0.1  # 最小相关性分数阈值
     
-    # Hybrid search weights
-    vector_weight: float = 0.7
-    keyword_weight: float = 0.3
+    # 混合搜索权重
+    vector_weight: float = 0.7  # 向量搜索权重
+    keyword_weight: float = 0.3  # 关键词搜索权重
     
-    # Memory sources
+    # 记忆来源
     sources: List[str] = field(default_factory=lambda: ["memory", "session"])
     
-    # Sync config
-    enable_auto_sync: bool = True
-    sync_on_search: bool = True
+    # 同步配置
+    enable_auto_sync: bool = True  # 启用自动同步
+    sync_on_search: bool = True  # 搜索时同步
     
     
     def get_workspace(self) -> Path:
-        """Get workspace root directory"""
+        """
+        获取工作区根目录
+        
+        Returns:
+            Path: 工作区路径对象
+        """
         return Path(self.workspace_root)
     
     def get_memory_dir(self) -> Path:
-        """Get memory files directory"""
+        """
+        获取记忆文件目录
+        
+        Returns:
+            Path: 记忆目录路径（workspace/memory）
+        """
         return self.get_workspace() / "memory"
     
     def get_db_path(self) -> Path:
-        """Get SQLite database path for long-term memory index"""
+        """
+        获取长期记忆索引的SQLite数据库路径
+        
+        Returns:
+            Path: 数据库文件路径
+        """
+        # 索引存储在 memory/long-term/index.db
         index_dir = self.get_memory_dir() / "long-term"
         index_dir.mkdir(parents=True, exist_ok=True)
         return index_dir / "index.db"
     
     def get_skills_dir(self) -> Path:
-        """Get skills directory"""
+        """
+        获取技能目录
+        
+        Returns:
+            Path: 技能目录路径
+        """
         return self.get_workspace() / "skills"
     
     def get_agent_workspace(self, agent_name: Optional[str] = None) -> Path:
         """
-        Get workspace directory for an agent
+        获取Agent的工作区目录
         
         Args:
-            agent_name: Optional agent name (not used in current implementation)
+            agent_name: 可选的Agent名称（当前实现未使用）
             
         Returns:
-            Path to workspace directory
+            Path: 工作区目录路径
         """
         workspace = self.get_workspace()
-        # Ensure workspace directory exists
+        # 确保工作区目录存在
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
 
-# Global memory configuration
+# 全局记忆配置实例
 _global_memory_config: Optional[MemoryConfig] = None
 
 
 def get_default_memory_config() -> MemoryConfig:
     """
-    Get the global memory configuration.
-    If not set, returns a default configuration.
+    获取全局记忆配置
+    
+    如果未设置，返回默认配置。
     
     Returns:
-        MemoryConfig instance
+        MemoryConfig: 记忆配置实例
     """
     global _global_memory_config
     if _global_memory_config is None:
@@ -103,11 +152,12 @@ def get_default_memory_config() -> MemoryConfig:
 
 def set_global_memory_config(config: MemoryConfig):
     """
-    Set the global memory configuration.
-    This should be called before creating any MemoryManager instances.
+    设置全局记忆配置
+    
+    应在创建任何MemoryManager实例之前调用。
     
     Args:
-        config: MemoryConfig instance to use globally
+        config: 要使用的MemoryConfig实例
         
     Example:
         >>> from agent.memory import MemoryConfig, set_global_memory_config

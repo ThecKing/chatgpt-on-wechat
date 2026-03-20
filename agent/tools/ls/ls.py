@@ -1,24 +1,52 @@
+# -*- coding: utf-8 -*-
 """
-Ls tool - List directory contents
+列出目录内容工具
+
+列出目录中的文件和子目录：
+- 按字母顺序排序
+- 目录以'/'后缀标识
+- 包含隐藏文件
+- 支持条目数量和字节限制
 """
 
+# 导入操作系统模块
 import os
+
+# 导入类型提示
 from typing import Dict, Any
 
+# 导入工具基类和结果类
 from agent.tools.base_tool import BaseTool, ToolResult
+
+# 导入截断工具
 from agent.tools.utils.truncate import truncate_head, format_size, DEFAULT_MAX_BYTES
+
+# 导入路径扩展工具
 from common.utils import expand_path
 
 
+# 默认条目限制
 DEFAULT_LIMIT = 500
 
 
 class Ls(BaseTool):
-    """Tool for listing directory contents"""
+    """
+    列出目录内容工具类
     
+    功能：
+    - 列出目录中的文件和子目录
+    - 字母顺序排序
+    - 目录标识为 name/
+    - 包含隐藏文件
+    """
+    
+    # 工具名称
     name: str = "ls"
+    
+    # 工具描述
     description: str = f"List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to {DEFAULT_LIMIT} entries or {DEFAULT_MAX_BYTES // 1024}KB (whichever is hit first)."
     
+    # 参数JSON Schema
     params: dict = {
         "type": "object",
         "properties": {
@@ -35,31 +63,47 @@ class Ls(BaseTool):
     }
     
     def __init__(self, config: dict = None):
+        """
+        初始化Ls工具
+        
+        Args:
+            config: 配置字典，可包含：
+                - cwd: 工作目录
+        """
+        # 存储配置
         self.config = config or {}
+        # 获取工作目录
         self.cwd = self.config.get("cwd", os.getcwd())
     
     def execute(self, args: Dict[str, Any]) -> ToolResult:
         """
-        Execute directory listing
+        执行目录列表操作
         
-        :param args: Listing parameters
-        :return: Directory contents or error
+        Args:
+            args: 列表参数
+                - path: 目录路径（默认当前目录）
+                - limit: 最大条目数
+            
+        Returns:
+            ToolResult: 目录内容或错误
         """
-        path = args.get("path", ".").strip()
-        limit = args.get("limit", DEFAULT_LIMIT)
+        # 获取参数
+        path = args.get("path", ".").strip()      # 目录路径
+        limit = args.get("limit", DEFAULT_LIMIT)  # 最大条目数
         
-        # Resolve path
+        # 解析路径
         absolute_path = self._resolve_path(path)
         
-        # Security check: Prevent accessing sensitive config directory
+        # 安全检查：防止访问敏感配置目录
         env_config_dir = expand_path("~/.cow")
         if os.path.abspath(absolute_path) == os.path.abspath(env_config_dir):
             return ToolResult.fail(
                 "Error: Access denied. API keys and credentials must be accessed through the env_config tool only."
             )
         
+        # 检查路径是否存在
         if not os.path.exists(absolute_path):
-            # Provide helpful hint if using relative path
+            # 如果使用相对路径，提供有用提示
             if not os.path.isabs(path) and not path.startswith('~'):
                 return ToolResult.fail(
                     f"Error: Path not found: {path}\n"
@@ -68,73 +112,92 @@ class Ls(BaseTool):
                 )
             return ToolResult.fail(f"Error: Path not found: {path}")
         
+        # 检查是否是目录
         if not os.path.isdir(absolute_path):
             return ToolResult.fail(f"Error: Not a directory: {path}")
         
         try:
-            # Read directory entries
+            # 读取目录条目
             entries = os.listdir(absolute_path)
             
-            # Sort alphabetically (case-insensitive)
+            # 按字母顺序排序（不区分大小写）
             entries.sort(key=lambda x: x.lower())
             
-            # Format entries with directory indicators
+            # 格式化条目（添加目录标识）
             results = []
             entry_limit_reached = False
             
             for entry in entries:
+                # 检查条目限制
                 if len(results) >= limit:
                     entry_limit_reached = True
                     break
                 
+                # 获取完整路径
                 full_path = os.path.join(absolute_path, entry)
                 
                 try:
+                    # 判断是否是目录
                     if os.path.isdir(full_path):
-                        results.append(entry + '/')
+                        results.append(entry + '/')  # 目录添加/后缀
                     else:
-                        results.append(entry)
+                        results.append(entry)       # 文件不添加后缀
                 except Exception:
-                    # Skip entries we can't stat
+                    # 跳过无法访问的条目
                     continue
             
+            # 如果没有条目
             if not results:
                 return ToolResult.success({"message": "(empty directory)", "entries": []})
             
-            # Format output
+            # 格式化输出
             raw_output = '\n'.join(results)
-            truncation = truncate_head(raw_output, max_lines=999999)  # Only limit by bytes
+            truncation = truncate_head(raw_output, max_lines=999999)  # 只限制字节数
             
             output = truncation.content
             details = {}
             notices = []
             
+            # 添加条目限制提示
             if entry_limit_reached:
                 notices.append(f"{limit} entries limit reached. Use limit={limit * 2} for more")
                 details["entry_limit_reached"] = limit
             
+            # 添加截断提示
             if truncation.truncated:
                 notices.append(f"{format_size(DEFAULT_MAX_BYTES)} limit reached")
                 details["truncation"] = truncation.to_dict()
             
+            # 添加提示信息
             if notices:
                 output += f"\n\n[{'. '.join(notices)}]"
             
             return ToolResult.success({
-                "output": output,
-                "entry_count": len(results),
-                "details": details if details else None
+                "output": output,               # 输出内容
+                "entry_count": len(results),    # 条目数量
+                "details": details if details else None  # 详情
             })
             
         except PermissionError:
+            # 权限错误
             return ToolResult.fail(f"Error: Permission denied reading directory: {path}")
         except Exception as e:
+            # 其他错误
             return ToolResult.fail(f"Error listing directory: {str(e)}")
     
     def _resolve_path(self, path: str) -> str:
-        """Resolve path to absolute path"""
-        # Expand ~ to user home directory
+        """
+        解析路径为绝对路径
+        
+        Args:
+            path: 相对或绝对路径
+            
+        Returns:
+            str: 绝对路径
+        """
+        # 扩展 ~ 为用户主目录
         path = expand_path(path)
         if os.path.isabs(path):
             return path
+        # 相对路径基于工作目录
         return os.path.abspath(os.path.join(self.cwd, path))

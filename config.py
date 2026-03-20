@@ -159,7 +159,7 @@ available_setting = {
     "channel_type": "",  # 通道类型，支持多渠道同时运行。单个: "feishu"，多个: "feishu, dingtalk" 或 ["feishu", "dingtalk"]。可选值: web,feishu,dingtalk,wecom_bot,wechatmp,wechatmp_service,wechatcom_app
     "web_console": True,  # 是否自动启动Web控制台（默认启动）。设为False可禁用
     "subscribe_msg": "",  # 订阅消息, 支持: wechatmp, wechatmp_service, wechatcom_app
-    "debug": False,  # 是否开启debug模式，开启后会打印更多日志
+    "debug": True,  # 是否开启debug模式，开启后会打印更多日志
     "appdata_dir": "",  # 数据目录
     # 插件配置
     "plugin_trigger_prefix": "$",  # 规范插件提供聊天相关指令的前缀，建议不要和管理员指令前缀"#"冲突
@@ -317,8 +317,8 @@ def load_config():
         # 跳过以下划线开头的注释字段
         if name.startswith("_"):
             continue
-        if name in available_setting:
-            logger.info("[INIT] override config by environ args: {}={}".format(name, value))
+        if name in available_setting:  # TODO 这个available_setting为啥不放在config.json里面呢？
+            logger.info("[INIT] override config by environ args: {}={}".format(name, value))  # Note 环境变量中的优先级大于配置文件中的优先级
             try:
                 config[name] = eval(value)
             except Exception:

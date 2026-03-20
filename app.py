@@ -27,6 +27,7 @@ def _parse_channel_type(raw) -> list:
       - single string: "feishu"
       - comma-separated string: "feishu, dingtalk"
       - list: ["feishu", "dingtalk"]
+      【解析chennels，确保格式一致】
     """
     if isinstance(raw, list):
         return [ch.strip() for ch in raw if ch.strip()]
